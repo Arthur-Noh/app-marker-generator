@@ -1,35 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Marker PNG bulk generator with final output scaled to 1.25x 'original' size.
+Generate EXACTLY ONE marker PNG (debug)
 
-- Input layouts are @3x images under assets/raws/layouts:
-  {type}_{selected}.png  e.g. detail_short_selected.png
-
-- Final output size is computed from the provided original (1x) geometry
-  multiplied by 1.25x, regardless of the input layout pixel size (which is 3x).
-
-- Operator / other icons are fitted into a SQUARE box (transparent padding),
-  preserving their aspect ratio, then centered on the balloon.
-
-- Font: assets/font/NotoSansKR-Regular.otf
-- Ranges: 0~10  (FF/SS = "00".."10")
-
-Usage:
-  python src/generate.py
-  python src/generate.py --type detail_short
-  python src/generate.py --operator ss --selected selected --lp lp
-  python src/generate.py --dry-run
+- detail_short filename: fast -> f{FF}.png, slow -> s{SS}.png
+- LP badge: canvas grows when lp==lp → +4px (1x) to left/top (+12px @3x)
+- Operator icon/text: type-specific anchors + pixel shifts (independent)
+- Text: no stroke, black; unselected=10px Regular, selected=12px Medium(500 if available)
+- Labels: '급{n}', '완{n}'
 """
 
 from __future__ import annotations
-import argparse
-import json
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont
+import argparse
+import sys
 
-# ====== Paths ======
+# ===== Paths =====
 BASE_DIR = Path(__file__).resolve().parents[1]
 ASSETS_DIR = BASE_DIR / "assets"
 RAW_DIR = ASSETS_DIR / "raws"
@@ -37,12 +25,11 @@ LAYOUT_DIR = RAW_DIR / "layouts"
 OP_ICON_DIR = RAW_DIR / "operator_icons"
 OTHER_ICON_DIR = RAW_DIR / "other_icons"
 BADGE_DIR = RAW_DIR / "badges"
-FONT_PATH = ASSETS_DIR / "font" / "NotoSansKR-Regular.otf"
+FONT_REGULAR = ASSETS_DIR / "font" / "NotoSansKR-Regular.otf"
+FONT_MEDIUM  = ASSETS_DIR / "font" / "NotoSansKR-Medium.otf"  # 선택 상태에서 있으면 사용
 RESULTS_DIR = ASSETS_DIR / "results"
-META_DIR = RESULTS_DIR / "_meta"
 
-# ====== Fixed dimensions (original 1x) & scale policy ======
-# Provided original sizes (width, height, innerHeight). Final output = 1.25x these originals.
+# ===== Geometry (1x) & final scale =====
 GEOM_1X = {
     "simple": {
         "unselected": {"width": 28.0, "height": 32.25, "innerHeight": 28.0},
@@ -57,299 +44,311 @@ GEOM_1X = {
         "selected":   {"width": 80.0, "height": 40.0,  "innerHeight": 33.92},
     },
 }
-FINAL_SCALE = 1.25  # 최종 산출물은 1.25배(원본 1x 대비)
+FINAL_SCALE = 1.25  # final vs 1x
 
-# ====== Fixed enums & ranges ======
+# ===== LP badge absolute size (1x) & offsets =====
+BADGE_SIZE_1X         = (30, 15)   # 1x
+CANVAS_PAD_1X_WHEN_LP = (4, 4)     # lp일 때 캔버스 (좌,상) 확장(1x)
+
+# 타입별 배지 오프셋(1x) — simple만 더 왼쪽
+BADGE_OFFSET_1X_BY_TYPE = {
+    "simple":       (-4, -4),
+    "detail_short": ( 0, -4),
+    "detail_long":  ( 0, -4),
+}
+
+def to_canvas_px_3x(px_1x: int) -> int:
+    return int(round(px_1x * 3))
+
+def badge_size_canvas() -> Tuple[int,int]:
+    w1x, h1x = BADGE_SIZE_1X
+    return to_canvas_px_3x(w1x), to_canvas_px_3x(h1x)
+
+def badge_offset_canvas_for(marker_type: str) -> Tuple[int,int]:
+    ox, oy = BADGE_OFFSET_1X_BY_TYPE.get(marker_type, (0, -4))
+    return to_canvas_px_3x(ox), to_canvas_px_3x(oy)
+
+def canvas_pad_when_lp() -> Tuple[int,int]:
+    px, py = CANVAS_PAD_1X_WHEN_LP
+    return to_canvas_px_3x(px), to_canvas_px_3x(py)
+
+# ===== Enums & defaults =====
 TYPES = ["simple", "detail_short", "detail_long"]
 SELECTED_STATES = ["selected", "unselected"]
 LP_STATES = ["lp", "no-lp"]
-FAST_VALUES = [f"{i:02d}" for i in range(0, 11)]  # "00".."10"
-SLOW_VALUES = FAST_VALUES.copy()
 FALLBACK_OPERATOR = "unlinked"
 
-# ====== Layout anchors (ratios) ======
-# - All positions are ratios on the @3x canvas (0..1)
-# - icon/ badge sizes are derived from innerHeight (on @3x canvas) via *_on_inner ratios
+# ===== Anchors (ratios on base @3x) =====
+# 아이콘/텍스트를 각각 독립 좌표(x,y)로 배치
 ANCHORS = {
     "simple": {
-        "operator_icon_center": (0.5, 0.45),
-        "icon_side_on_inner": 0.95,   # icon square side ~= 0.95 * innerHeight(@3x)
-        "badge_left_top": (0.10, 0.10),
-        "badge_width_on_height": 0.28,  # badge width = 0.28 * H(@3x)
+        "operator_icon_center": (0.50, 0.50),
+        "icon_side_on_inner": 0.75,   # 작게 (기존 0.95 -> 0.85)
     },
     "detail_short": {
         "operator_icon_center": (0.16, 0.42),
-        "icon_side_on_inner": 0.95,
-        "fast_text_center": (0.54, 0.40),
-        "slow_text_center": (0.80, 0.40),
-        "font_on_inner": 0.78,  # font size ~= 0.78 * innerHeight(@3x)
-        "badge_left_top": (0.12, 0.15),
-        "badge_width_on_height": 0.22,
+        "text_single_center":   (0.67, 0.40),
+        "icon_side_on_inner":   0.75,
     },
     "detail_long": {
-        "operator_icon_center": (0.14, 0.44),
-        "icon_side_on_inner": 0.95,
-        "fast_text_center": (0.55, 0.45),
-        "slow_text_center": (0.82, 0.45),
-        "font_on_inner": 0.72,
-        "badge_left_top": (0.12, 0.15),
-        "badge_width_on_height": 0.20,
+        "operator_icon_center": (0.14, 0.44),  # 비율은 유지, 대신 픽셀 시프트로 오른쪽 이동
+        "fast_text_center":     (0.55, 0.45),
+        "slow_text_center":     (0.82, 0.45),
+        "icon_side_on_inner":   0.75,
     }
 }
 
-# ====== Text style ======
-TEXT_FILL = (255, 255, 255, 255)
-TEXT_STROKE = (0, 0, 0, 255)
-TEXT_STROKE_WIDTH = 3
+# 아이콘 X 시프트(오른쪽 +, 1x px)
+ICON_RIGHT_SHIFT_1X = {
+    "simple": 0,
+    "detail_short": 10,
+    "detail_long": 10,   # → detail_long 아이콘을 더 오른쪽으로
+}
 
-def fast_label(ff: str) -> str:
-    return str(int(ff))
+# 아이콘 Y 시프트(위로 -, 1x px)
+ICON_Y_SHIFT_1X = {
+    "simple": -2,
+    "detail_short": -2,
+    "detail_long":  -2,
+}
 
-def slow_label(ss: str) -> str:
-    return str(int(ss))
+# 텍스트 시프트(좌/상, 1x px) — detail_long 텍스트만 왼쪽/위쪽으로 더 이동
+TEXT_SHIFT_X_1X = {
+    "simple": 0,
+    "detail_short": 0,
+    "detail_long": -4,  # ← 왼쪽으로
+}
+TEXT_SHIFT_Y_1X = {
+    "simple": -2,
+    "detail_short": -3,
+    "detail_long": -4,  # ↑ 위로
+}
 
-# ====== Utils ======
+# ===== Text style =====
+TEXT_FILL = (17, 17, 17, 255)  # 검정(#111)
+
+def canvas_font_px_from_final(final_px: int) -> int:
+    return max(8, int(round(final_px * 3.0 / FINAL_SCALE)))
+
+def pick_font_path(selected: str) -> Path:
+    if selected == "selected" and FONT_MEDIUM.exists():
+        return FONT_MEDIUM
+    return FONT_REGULAR
+
+def fast_label(n: int) -> str:
+    return f"급{int(n)}"
+
+def slow_label(n: int) -> str:
+    return f"완{int(n)}"
+
+# ===== Utils =====
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 def load_rgba(path: Path) -> Image.Image:
-    im = Image.open(path).convert("RGBA")
-    return im
-
-def scale_to_width(im: Image.Image, target_w: int) -> Image.Image:
-    w, h = im.size
-    if w == target_w:
-        return im
-    ratio = target_w / float(w)
-    return im.resize((target_w, max(1, int(h * ratio))), Image.LANCZOS)
+    if not path.exists():
+        sys.exit(f"[ERR] Not found: {path}")
+    return Image.open(path).convert("RGBA")
 
 def scale_to_fit(im: Image.Image, target_w: int, target_h: int) -> Image.Image:
     w, h = im.size
-    if w <= 0 or h <= 0:
-        return im
     ratio = min(target_w / float(w), target_h / float(h))
-    new_w = max(1, int(w * ratio))
-    new_h = max(1, int(h * ratio))
-    return im.resize((new_w, new_h), Image.LANCZOS)
+    return im.resize((max(1, int(w * ratio)), max(1, int(h * ratio))), Image.LANCZOS)
 
 def make_square_fit(im: Image.Image, side: int) -> Image.Image:
-    """Preserve aspect; fit entire image into a square 'side'x'side' with transparent padding."""
     fitted = scale_to_fit(im, side, side)
     canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
     x = (side - fitted.size[0]) // 2
     y = (side - fitted.size[1]) // 2
-    canvas.alpha_composite(fitted, (x, y))
+    canvas.paste(fitted, (x, y), fitted)
     return canvas
 
-def paste_center(base: Image.Image, overlay: Image.Image, center_xy: Tuple[float, float]) -> None:
-    W, H = base.size
-    x = int(W * center_xy[0]) - overlay.size[0] // 2
-    y = int(H * center_xy[1]) - overlay.size[1] // 2
-    base.alpha_composite(overlay, (x, y))
+def center_from_anchor(base_origin: Tuple[int,int], base_size: Tuple[int,int],
+                       anchor_x: float, anchor_y: float,
+                       extra_dx_px: int=0, extra_dy_px: int=0) -> Tuple[int,int]:
+    ox, oy = base_origin; bw, bh = base_size
+    cx = ox + int(bw * anchor_x) + extra_dx_px
+    cy = oy + int(bh * anchor_y) + extra_dy_px
+    return cx, cy
 
-def paste_topleft_with_width_ratio(base: Image.Image, overlay: Image.Image, left_top_ratio: Tuple[float, float], width_ratio_on_height: float) -> None:
-    """Badge: width = width_ratio_on_height * H(@3x). Keeps aspect ratio."""
-    W, H = base.size
-    target_w = int(H * width_ratio_on_height)
-    ov = scale_to_width(overlay, max(1, target_w))
-    x = int(W * left_top_ratio[0])
-    y = int(H * left_top_ratio[1])
-    base.alpha_composite(ov, (x, y))
+def paste_center_at(canvas: Image.Image, overlay: Image.Image, center_xy: Tuple[int,int]) -> None:
+    x = center_xy[0] - overlay.size[0] // 2
+    y = center_xy[1] - overlay.size[1] // 2
+    canvas.paste(overlay, (x, y), overlay)
 
-def draw_centered_text(base: Image.Image, text: str, center_xy: Tuple[float, float], font: ImageFont.FreeTypeFont) -> None:
-    W, H = base.size
-    x = int(W * center_xy[0])
-    y = int(H * center_xy[1])
-    draw = ImageDraw.Draw(base)
-    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=TEXT_STROKE_WIDTH)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    pos = (x - tw // 2, y - th // 2)
-    draw.text(pos, text, font=font, fill=TEXT_FILL, stroke_fill=TEXT_STROKE, stroke_width=TEXT_STROKE_WIDTH)
+def paste_topleft_abs(canvas: Image.Image, overlay: Image.Image, topleft_xy: Tuple[int,int]) -> None:
+    canvas.paste(overlay, topleft_xy, overlay)
 
-# ====== Geometry helpers ======
-def geom_for(marker_type: str, selected: str) -> dict:
-    return GEOM_1X[marker_type][selected]
+def draw_centered_text_at(canvas: Image.Image, text: str, center_xy: Tuple[int,int], font: ImageFont.FreeTypeFont) -> None:
+    draw = ImageDraw.Draw(canvas)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
+    pos = (center_xy[0] - tw // 2, center_xy[1] - th // 2)
+    draw.text(pos, text, font=font, fill=TEXT_FILL)
 
-def final_output_size(marker_type: str, selected: str) -> Tuple[int, int]:
-    g = geom_for(marker_type, selected)
-    w = int(round(g["width"] * FINAL_SCALE))
-    h = int(round(g["height"] * FINAL_SCALE))
+# ===== Geometry helpers =====
+def final_output_size(marker_type: str, selected: str, lp: str) -> Tuple[int, int]:
+    g = GEOM_1X[marker_type][selected]
+    add_w_1x = CANVAS_PAD_1X_WHEN_LP[0] if lp == "lp" else 0
+    add_h_1x = CANVAS_PAD_1X_WHEN_LP[1] if lp == "lp" else 0
+    w = int(round((g["width"]  + add_w_1x) * FINAL_SCALE))
+    h = int(round((g["height"] + add_h_1x) * FINAL_SCALE))
     return max(1, w), max(1, h)
 
 def inner_height_at_3x(marker_type: str, selected: str) -> int:
-    """innerHeight (1x) -> multiply by 3 for the layout canvas scale."""
-    g = geom_for(marker_type, selected)
+    g = GEOM_1X[marker_type][selected]
     return int(round(g["innerHeight"] * 3.0))
 
-# ====== Path helpers ======
+# ===== Paths =====
 def layout_path(marker_type: str, selected_state: str) -> Path:
-    # e.g. detail_short_selected.png
     return LAYOUT_DIR / f"{marker_type}_{selected_state}.png"
 
 def output_path_simple(operator: str, selected_state: str, lp_state: str) -> Path:
     return RESULTS_DIR / "simple" / operator / selected_state / lp_state / "base.png"
 
-def output_path_detail(marker_type: str, operator: str, selected_state: str, lp_state: str, ff: str, ss: str) -> Path:
-    return RESULTS_DIR / marker_type / operator / selected_state / lp_state / f"f{ff}_s{ss}.png"
+def output_filename_detail(marker_type: str, ff: int, ss: int, mode_short: str) -> str:
+    if marker_type == "detail_short":
+        return f"f{ff:02d}.png" if mode_short == "fast" else f"s{ss:02d}.png"
+    return f"f{ff:02d}_s{ss:02d}.png"
 
-def read_operator_codes() -> List[str]:
-    if not OP_ICON_DIR.exists():
-        return []
-    return sorted([p.stem for p in OP_ICON_DIR.glob("*.png")])
+def output_path_detail(marker_type: str, operator: str, selected_state: str, lp_state: str, ff: int, ss: int, mode_short: str) -> Path:
+    return RESULTS_DIR / marker_type / operator / selected_state / lp_state / output_filename_detail(marker_type, ff, ss, mode_short)
 
 def pick_operator_icon(operator: str) -> Path:
     cand = OP_ICON_DIR / f"{operator}.png"
-    if cand.exists():
-        return cand
+    if cand.exists(): return cand
     fb = OTHER_ICON_DIR / f"{FALLBACK_OPERATOR}.png"
     return fb if fb.exists() else cand
 
-# ====== Composition ======
-def compose_simple(operator: str, selected: str, lp: str, dry: bool=False) -> Optional[Path]:
+# ===== Compose (one image) =====
+def compose_simple(operator: str, selected: str, lp: str) -> Optional[Path]:
     mtype = "simple"
-    base_img_path = layout_path(mtype, selected)
-    out_fp = output_path_simple(operator, selected, lp)
+    layout = load_rgba(layout_path(mtype, selected))  # base @3x
+    bw, bh = layout.size
 
-    if dry:
-        print("[DRY] SIMPLE", operator, selected, lp, "->", out_fp)
-        return out_fp
+    pad_left, pad_top = canvas_pad_when_lp() if lp == "lp" else (0, 0)
+    canvas = Image.new("RGBA", (bw + pad_left, bh + pad_top), (0, 0, 0, 0))
+    base_origin = (pad_left, pad_top)
+    canvas.paste(layout, base_origin, layout)
 
-    ensure_dir(out_fp.parent)
-    base = load_rgba(base_img_path)  # @3x canvas
-
-    # operator icon into square box (based on innerHeight@3x)
+    # icon
     inner3 = inner_height_at_3x(mtype, selected)
     icon_side = int(round(inner3 * ANCHORS[mtype]["icon_side_on_inner"]))
-    icon = load_rgba(pick_operator_icon(operator))
-    icon_sq = make_square_fit(icon, max(1, icon_side))
-    paste_center(base, icon_sq, ANCHORS[mtype]["operator_icon_center"])
+    icon_sq = make_square_fit(load_rgba(pick_operator_icon(operator)), max(1, icon_side))
+    shift_x = to_canvas_px_3x(ICON_RIGHT_SHIFT_1X[mtype])
+    shift_y = to_canvas_px_3x(ICON_Y_SHIFT_1X[mtype])
+    ax, ay = ANCHORS[mtype]["operator_icon_center"]
+    center = center_from_anchor(base_origin, (bw, bh), ax, ay, extra_dx_px=shift_x, extra_dy_px=shift_y)
+    paste_center_at(canvas, icon_sq, center)
 
-    # lp badge
+    # LP badge
     if lp == "lp":
-        badge_fp = BADGE_DIR / "luckypass.png"
-        if badge_fp.exists():
-            badge = load_rgba(badge_fp)
-            paste_topleft_with_width_ratio(base, badge, ANCHORS[mtype]["badge_left_top"], ANCHORS[mtype]["badge_width_on_height"])
+        badge_w, badge_h = badge_size_canvas()
+        badge = load_rgba(BADGE_DIR / "luckypass.png").resize((badge_w, badge_h), Image.LANCZOS)
+        bx_off, by_off = badge_offset_canvas_for(mtype)
+        bx = base_origin[0] + bx_off
+        by = base_origin[1] + by_off
+        paste_topleft_abs(canvas, badge, (bx, by))
 
-    # final resize to 1.25x of 1x original
-    final_w, final_h = final_output_size(mtype, selected)
-    base = base.resize((final_w, final_h), Image.LANCZOS)
-    base.save(out_fp, format="PNG", optimize=True)
+    # final resize
+    out_fp = output_path_simple(operator, selected, lp)
+    ensure_dir(out_fp.parent)
+    final_w, final_h = final_output_size(mtype, selected, lp)
+    canvas.resize((final_w, final_h), Image.LANCZOS).save(out_fp, format="PNG", optimize=True)
+    print("[OK]", out_fp)
     return out_fp
 
-def compose_detail(marker_type: str, operator: str, selected: str, lp: str, ff: str, ss: str, dry: bool=False) -> Optional[Path]:
-    base_img_path = layout_path(marker_type, selected)
-    out_fp = output_path_detail(marker_type, operator, selected, lp, ff, ss)
+def compose_detail(marker_type: str, operator: str, selected: str, lp: str, ff: int, ss: int, mode_short: str="fast") -> Optional[Path]:
+    layout = load_rgba(layout_path(marker_type, selected))  # base @3x
+    bw, bh = layout.size
 
-    if dry:
-        print("[DRY]", marker_type, operator, selected, lp, ff, ss, "->", out_fp)
-        return out_fp
+    pad_left, pad_top = canvas_pad_when_lp() if lp == "lp" else (0, 0)
+    canvas = Image.new("RGBA", (bw + pad_left, bh + pad_top), (0, 0, 0, 0))
+    base_origin = (pad_left, pad_top)
+    canvas.paste(layout, base_origin, layout)
 
-    ensure_dir(out_fp.parent)
-    base = load_rgba(base_img_path)  # @3x canvas
-
-    # operator icon as square (innerHeight@3x)
+    # icon
     inner3 = inner_height_at_3x(marker_type, selected)
     icon_side = int(round(inner3 * ANCHORS[marker_type]["icon_side_on_inner"]))
-    icon = load_rgba(pick_operator_icon(operator))
-    icon_sq = make_square_fit(icon, max(1, icon_side))
-    paste_center(base, icon_sq, ANCHORS[marker_type]["operator_icon_center"])
+    icon_sq = make_square_fit(load_rgba(pick_operator_icon(operator)), max(1, icon_side))
+    shift_x = to_canvas_px_3x(ICON_RIGHT_SHIFT_1X[marker_type])
+    shift_y = to_canvas_px_3x(ICON_Y_SHIFT_1X[marker_type])
+    ax, ay = ANCHORS[marker_type]["operator_icon_center"]
+    center = center_from_anchor(base_origin, (bw, bh), ax, ay, extra_dx_px=shift_x, extra_dy_px=shift_y)
+    paste_center_at(canvas, icon_sq, center)
 
-    # badge
+    # LP badge
     if lp == "lp":
-        badge_fp = BADGE_DIR / "luckypass.png"
-        if badge_fp.exists():
-            badge = load_rgba(badge_fp)
-            paste_topleft_with_width_ratio(base, badge, ANCHORS[marker_type]["badge_left_top"], ANCHORS[marker_type]["badge_width_on_height"])
+        badge_w, badge_h = badge_size_canvas()
+        badge = load_rgba(BADGE_DIR / "luckypass.png").resize((badge_w, badge_h), Image.LANCZOS)
+        bx_off, by_off = badge_offset_canvas_for(marker_type)
+        bx = base_origin[0] + bx_off
+        by = base_origin[1] + by_off
+        paste_topleft_abs(canvas, badge, (bx, by))
 
-    # text (fast/slow) with font size based on innerHeight@3x
-    font_px = max(8, int(round(inner3 * ANCHORS[marker_type]["font_on_inner"])))
-    font = ImageFont.truetype(str(FONT_PATH), font_px)
-    draw_centered_text(base, fast_label(ff), ANCHORS[marker_type]["fast_text_center"], font)
-    draw_centered_text(base, slow_label(ss), ANCHORS[marker_type]["slow_text_center"], font)
+    # text
+    final_px  = 12 if selected == "selected" else 10
+    font_px   = canvas_font_px_from_final(final_px)
+    font_path = pick_font_path(selected)
+    font      = ImageFont.truetype(str(font_path), font_px)
+    tdx = to_canvas_px_3x(TEXT_SHIFT_X_1X[marker_type])
+    tdy = to_canvas_px_3x(TEXT_SHIFT_Y_1X[marker_type])
 
-    # final resize to 1.25x of 1x original
-    final_w, final_h = final_output_size(marker_type, selected)
-    base = base.resize((final_w, final_h), Image.LANCZOS)
-    base.save(out_fp, format="PNG", optimize=True)
+    if marker_type == "detail_short":
+        text = fast_label(ff) if mode_short == "fast" else slow_label(ss)
+        tx, ty = ANCHORS[marker_type]["text_single_center"]
+        cxy = center_from_anchor(base_origin, (bw, bh), tx, ty, extra_dx_px=tdx, extra_dy_px=tdy)
+        draw_centered_text_at(canvas, text, cxy, font)
+    else:
+        fx, fy = ANCHORS[marker_type]["fast_text_center"]
+        sx, sy = ANCHORS[marker_type]["slow_text_center"]
+        c1 = center_from_anchor(base_origin, (bw, bh), fx, fy, extra_dx_px=tdx, extra_dy_px=tdy)
+        c2 = center_from_anchor(base_origin, (bw, bh), sx, sy, extra_dx_px=tdx, extra_dy_px=tdy)
+        draw_centered_text_at(canvas, fast_label(ff), c1, font)
+        draw_centered_text_at(canvas, slow_label(ss), c2, font)
+
+    # final resize
+    out_fp = output_path_detail(marker_type, operator, selected, lp, ff, ss, mode_short)
+    ensure_dir(out_fp.parent)
+    final_w, final_h = final_output_size(marker_type, selected, lp)
+    canvas.resize((final_w, final_h), Image.LANCZOS).save(out_fp, format="PNG", optimize=True)
+    print("[OK]", out_fp)
     return out_fp
 
-# ====== Generation ======
-def generate_all(
-    marker_types: List[str],
-    operators: List[str],
-    selected_states: List[str],
-    lp_states: List[str],
-    fast_values: List[str],
-    slow_values: List[str],
-    dry_run: bool=False
-) -> int:
-    count = 0
-    for t in marker_types:
-        for op in operators:
-            for sel in selected_states:
-                for lp in lp_states:
-                    if t == "simple":
-                        compose_simple(op, sel, lp, dry=dry_run); count += 1
-                    else:
-                        for ff in fast_values:
-                            for ss in slow_values:
-                                compose_detail(t, op, sel, lp, ff, ss, dry=dry_run); count += 1
-    return count
-
-def write_manifest(
-    marker_types: List[str],
-    operators: List[str],
-    selected_states: List[str],
-    lp_states: List[str],
-    fast_values: List[str],
-    slow_values: List[str],
-):
-    ensure_dir(META_DIR)
-    manifest = {
-        "types": marker_types,
-        "states": selected_states,
-        "lp": lp_states,
-        "fastValues": fast_values,
-        "slowValues": slow_values,
-        "fallbackOperator": FALLBACK_OPERATOR,
-        "template": {
-            "simple": "assets/results/simple/{operator}/{state}/{lp}/base.png",
-            "detail": "assets/results/{type}/{operator}/{state}/{lp}/f{FF}_s{SS}.png"
-        },
-        "finalScale": FINAL_SCALE,
-        "geomOriginal1x": GEOM_1X
-    }
-    with open(META_DIR / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
-
-# ====== CLI ======
+# ===== CLI (single only) =====
 def parse_args():
-    import argparse
-    p = argparse.ArgumentParser(description="Generate marker PNGs into assets/results/ with 1.25x final size.")
-    p.add_argument("--type", choices=TYPES + ["all"], default="all")
-    p.add_argument("--operator", action="append", help="Generate only for specific operator code(s).")
-    p.add_argument("--selected", choices=["selected", "unselected", "both"], default="both")
-    p.add_argument("--lp", choices=["lp", "no-lp", "both"], default="both")
+    p = argparse.ArgumentParser(description="Generate exactly ONE marker image (type-specific positioning).")
+    p.add_argument("--type", choices=TYPES, default="detail_short")
+    p.add_argument("--operator", required=False, help="operator code (ex: ss, ke). If omitted, tries first icon or 'unlinked'.")
+    p.add_argument("--selected", choices=SELECTED_STATES, default="selected")
+    p.add_argument("--lp", choices=LP_STATES, default="lp")
+    p.add_argument("--fast", type=int, default=3, help="0~99 (detail_* only)")
+    p.add_argument("--slow", type=int, default=7, help="0~99 (detail_* only)")
+    p.add_argument("--mode", choices=["fast","slow"], default="fast", help="detail_short에서 어떤 값만 표기할지")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--no-manifest", action="store_true")
     return p.parse_args()
+
+def autodetect_operator() -> str:
+    pngs = sorted(OP_ICON_DIR.glob("*.png"))
+    if pngs:
+        return pngs[0].stem
+    return FALLBACK_OPERATOR
 
 def main():
     args = parse_args()
-    marker_types = TYPES if args.type == "all" else [args.type]
-    operators = args.operator if args.operator else (read_operator_codes() or [FALLBACK_OPERATOR])
-    selected_states = SELECTED_STATES if args.selected == "both" else [args.selected]
-    lp_states = LP_STATES if args.lp == "both" else [args.lp]
+    operator = args.operator or autodetect_operator()
+    ff = max(0, min(99, args.fast))
+    ss = max(0, min(99, args.slow))
 
-    ensure_dir(RESULTS_DIR)
-    total = generate_all(marker_types, operators, selected_states, lp_states, FAST_VALUES, SLOW_VALUES, dry_run=args.dry_run)
+    if args.dry_run:
+        print("[DRY] one:", dict(type=args.type, operator=operator, selected=args.selected, lp=args.lp, fast=ff, slow=ss, mode=args.mode))
+        print("=> filename:", output_filename_detail(args.type, ff, ss, args.mode) if args.type!='simple' else "base.png")
+        return
 
-    if not args.no_manifest and not args.dry_run:
-        write_manifest(marker_types, operators, selected_states, lp_states, FAST_VALUES, SLOW_VALUES)
-
-    print(f"Done. {'(dry-run) ' if args.dry_run else ''}Generated plans/files: {total}")
+    if args.type == "simple":
+        compose_simple(operator, args.selected, args.lp)
+    else:
+        compose_detail(args.type, operator, args.selected, args.lp, ff, ss, mode_short=args.mode)
 
 if __name__ == "__main__":
     main()
